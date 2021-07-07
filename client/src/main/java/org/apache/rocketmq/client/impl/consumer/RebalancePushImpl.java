@@ -30,6 +30,7 @@ import org.apache.rocketmq.common.consumer.ConsumeFromWhere;
 import org.apache.rocketmq.common.message.MessageQueue;
 import org.apache.rocketmq.common.protocol.heartbeat.ConsumeType;
 import org.apache.rocketmq.common.protocol.heartbeat.MessageModel;
+import org.apache.rocketmq.common.protocol.heartbeat.SubscriptionData;
 
 public class RebalancePushImpl extends RebalanceImpl {
     private final static long UNLOCK_DELAY_TIME_MILLS = Long.parseLong(System.getProperty("rocketmq.client.unlockDelayTimeMills", "20000"));
@@ -39,7 +40,8 @@ public class RebalancePushImpl extends RebalanceImpl {
         this(null, null, null, null, defaultMQPushConsumerImpl);
     }
 
-    public RebalancePushImpl(String consumerGroup, MessageModel messageModel, AllocateMessageQueueStrategy allocateMessageQueueStrategy,
+    public RebalancePushImpl(String consumerGroup, MessageModel messageModel,
+        AllocateMessageQueueStrategy allocateMessageQueueStrategy,
         MQClientInstance mQClientFactory, DefaultMQPushConsumerImpl defaultMQPushConsumerImpl) {
         super(consumerGroup, messageModel, allocateMessageQueueStrategy, mQClientFactory);
         this.defaultMQPushConsumerImpl = defaultMQPushConsumerImpl;
@@ -47,6 +49,36 @@ public class RebalancePushImpl extends RebalanceImpl {
 
     @Override
     public void messageQueueChanged(String topic, Set<MessageQueue> mqAll, Set<MessageQueue> mqDivided) {
+        /**
+         * When rebalance result changed, should update subscription's version to notify broker.
+         * Fix: inconsistency subscription may lead to consumer miss messages.
+         */
+        SubscriptionData subscriptionData = this.subscriptionInner.get(topic);
+        long newVersion = System.currentTimeMillis();
+        log.info("{} Rebalance changed, also update version: {}, {}", topic, subscriptionData.getSubVersion(), newVersion);
+        subscriptionData.setSubVersion(newVersion);
+
+        int currentQueueCount = this.processQueueTable.size();
+        if (currentQueueCount != 0) {
+            int pullThresholdForTopic = this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdForTopic();
+            if (pullThresholdForTopic != -1) {
+                int newVal = Math.max(1, pullThresholdForTopic / currentQueueCount);
+                log.info("The pullThresholdForQueue is changed from {} to {}",
+                    this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdForQueue(), newVal);
+                this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().setPullThresholdForQueue(newVal);
+            }
+
+            int pullThresholdSizeForTopic = this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdSizeForTopic();
+            if (pullThresholdSizeForTopic != -1) {
+                int newVal = Math.max(1, pullThresholdSizeForTopic / currentQueueCount);
+                log.info("The pullThresholdSizeForQueue is changed from {} to {}",
+                    this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdSizeForQueue(), newVal);
+                this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().setPullThresholdSizeForQueue(newVal);
+            }
+        }
+
+        // notify broker
+        this.getmQClientFactory().sendHeartbeatToAllBrokerWithLock();
     }
 
     @Override
@@ -56,15 +88,15 @@ public class RebalancePushImpl extends RebalanceImpl {
         if (this.defaultMQPushConsumerImpl.isConsumeOrderly()
             && MessageModel.CLUSTERING.equals(this.defaultMQPushConsumerImpl.messageModel())) {
             try {
-                if (pq.getLockConsume().tryLock(1000, TimeUnit.MILLISECONDS)) {
+                if (pq.getConsumeLock().tryLock(1000, TimeUnit.MILLISECONDS)) {
                     try {
                         return this.unlockDelay(mq, pq);
                     } finally {
-                        pq.getLockConsume().unlock();
+                        pq.getConsumeLock().unlock();
                     }
                 } else {
-                    log.warn("[WRONG]mq is consuming, so can not unlock it, {}. maybe hanged for a while, {}", //
-                        mq, //
+                    log.warn("[WRONG]mq is consuming, so can not unlock it, {}. maybe hanged for a while, {}",
+                        mq,
                         pq.getTryUnlockTimes());
 
                     pq.incTryUnlockTimes();
@@ -105,8 +137,20 @@ public class RebalancePushImpl extends RebalanceImpl {
         this.defaultMQPushConsumerImpl.getOffsetStore().removeOffset(mq);
     }
 
+    @Deprecated
     @Override
     public long computePullFromWhere(MessageQueue mq) {
+        long result = -1L;
+        try {
+            result = computePullFromWhereWithException(mq);
+        } catch (MQClientException e) {
+            log.warn("Compute consume offset exception, mq={}", mq);
+        }
+        return result;
+    }
+
+    @Override
+    public long computePullFromWhereWithException(MessageQueue mq) throws MQClientException {
         long result = -1;
         final ConsumeFromWhere consumeFromWhere = this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getConsumeFromWhere();
         final OffsetStore offsetStore = this.defaultMQPushConsumerImpl.getOffsetStore();
@@ -127,7 +171,8 @@ public class RebalancePushImpl extends RebalanceImpl {
                         try {
                             result = this.mQClientFactory.getMQAdminImpl().maxOffset(mq);
                         } catch (MQClientException e) {
-                            result = -1;
+                            log.warn("Compute consume offset from last offset exception, mq={}, exception={}", mq, e);
+                            throw e;
                         }
                     }
                 } else {
@@ -155,15 +200,17 @@ public class RebalancePushImpl extends RebalanceImpl {
                         try {
                             result = this.mQClientFactory.getMQAdminImpl().maxOffset(mq);
                         } catch (MQClientException e) {
-                            result = -1;
+                            log.warn("Compute consume offset from last offset exception, mq={}, exception={}", mq, e);
+                            throw e;
                         }
                     } else {
                         try {
                             long timestamp = UtilAll.parseDate(this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getConsumeTimestamp(),
-                                UtilAll.YYYY_MMDD_HHMMSS).getTime();
+                                UtilAll.YYYYMMDDHHMMSS).getTime();
                             result = this.mQClientFactory.getMQAdminImpl().searchOffset(mq, timestamp);
                         } catch (MQClientException e) {
-                            result = -1;
+                            log.warn("Compute consume offset from last offset exception, mq={}, exception={}", mq, e);
+                            throw e;
                         }
                     }
                 } else {
